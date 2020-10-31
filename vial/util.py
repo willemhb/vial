@@ -9,25 +9,17 @@ from enum import Enum
 
 CAPTURE_PAT = re.compile(r"^<([a-zA-Z:]+)>$")
 
-
-class PatternRules(Enum):
-    """
-    An Enum storing the builtin URL matching patterns.
-    """
-    INT = r"\d+"
-    FLOAT = r"(?:\d*\.\d+)|(?:\d+\.\*)"
-    PATH = r"(?:\w+/)*(?:\w+\.[a-zA-Z]{1,6}){1}"
-    ANY = r"[^/]+"
-
-
-BUILTIN_FILTERS = {r.name.lower(): r.value for r in PatternRules}
-
-    
+BUILTIN_FILTERS = {
+    "int": r"\d+",
+    "float": r"(?:\d*\.\d+)|(?:\d+\.\*)",
+    "path": r"(?:\w+/)*(?:\w+\.\w{1,6}){1}",
+    "any": r"[^/]+",
+    }
 
 def eval_pattern(captured_pat):
     if len(captured_pat) == 2:
         gname, pname = captured_pat
-        pat = PatternRules[pname.upper()].value
+        pat = BUILTIN_FILTERS.get(pname, r"[^/]+")
 
     elif len(captured_pat) == 3:
         if captured_pat[1].lower() != "re":

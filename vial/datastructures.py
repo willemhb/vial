@@ -3,7 +3,7 @@ This module provides data abstractions not already in the Python standard librar
 """
 from functools import wraps, cached_property
 from dataclasses import dataclass, is_dataclass
-from collections.abc import Mapping, Set, MutableSet
+from collections.abc import Mapping, MutableMapping, Set, MutableSet
 from enum import Enum
 from .util import parse_url_patterns, eval_pattern
 import re
@@ -54,67 +54,31 @@ class AsgiTypeKeys(str, Enum):
         return obj
 
 
-class BaseRule:
-    """
-    A base class for URL path rules.
-    """
-    def __init__(self, key, /,):
+class RuleTypes(str, Enum):
+    STATIC = "static"
+    DYNAMIC = "dynamic"
+
+
+class Rule:
+    def __init__(self, key, value):
         self.key = key
-
-    def __hash__(self):
-        return hash(self.key)
-
-    def match(self, s):
-        raise NotImplementedError("Subclasses must override this method.")
-
-    def __repr__(self):
-        return f"<{type(self).__name__} key='{self.key}'>"
+        self.value = value
 
 
-class StaticRule(BaseRule):
-    """
-    Matches based on equality with the key value.
-    """
-    def match(self, s):
-        return s == self.key
+class RuleSet:
+    def __init__(self, static=True):
+        self._type = RuleTypes.STATIC if static == True else RuleTypes.DYNAMIC
+        self._rules = {}
 
+    def __getitem__(self, rule):
+        return self._rules[rule.key]
 
-class PatternRule(BaseRule):
-    def __init__(self, pattern):
-        self.key, self.regex = eval_pattern(pattern)
+    def __setitem__(self, rule, value):
+        self._rules[rule.key] = value
 
-    
-
-class RuleSet(BaseRule):
-    def __init__(self, *args):
-        self.key = "__ruleset__"
-        self._rules = {arg: None for arg in args}
-
-    
-    
-
-class RuleNode:
-    """
-    Represents a single node in a route Tree.
-
-    Every node has an endpoint, which it returns in response to
-    the empty string, and a dictionary of rules that it tries in order.
-    """
-    def __init__(self, endpoint):
-        """
-        Set up the data attributes of the node.
-        """
-        self.endpoint = endpoint # The callable associated with the route at this Node
-        self.rules = {
-            "static": {},
-        }
-
-    def add_rule(self, rule):
-        """
-        Add the rule to self.static_rules or self.pattern_rules.
-        """
 
 class RouteTable(Mapping):
     """
-    Creates a .
+    Creates a routing table (a recursive tree-structured set of routes).
     """
+    
