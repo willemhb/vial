@@ -8,7 +8,7 @@ from functools import wraps, cached_property
 from itertools import chain, starmap
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
-from collections.abc import Mapping, MutableMapping, Set, MutableSet
+from collections.abc import Mapping, MutableMapping, Set, MutableSet, Sequence, MutableSequence
 from typing import Union, Optional, Any, Iterable
 from http import HTTPStatus, cookies
 from urllib import parse
@@ -257,6 +257,60 @@ class MultiDict(MutableMapping):
 
     __str__ = __repr__
 
+
+def sparse_index(coll, dim):
+    filled = [None] * dim
+    filled[:len(coll)] = coll
+    return tuple(filled)    
+
+
+class SparseArray(MutableSequence):
+    """
+    Represents an array of arbitrary dimension that's mostly empty.
+
+    Represented by a dict whose keys are tuples, where the 0-th item
+    in the tuple represents the 0-th index, the 1st item represents the
+    1st index, and so on.
+    """
+    def __init__(self, dim):
+        self._dim = dim  # represents the length of the key; a key can have fewer than than this,
+                         # but by defualt they're filled in with none
+        self._array = dict()
+
+    # general sequence functions
+    def __len__(self):
+        return len(self._array.values())
+
+    def __contains__(self, item):
+        return item in self._array.values()
+
+    # iteration functions
+    def __iter__(self):
+        def inner(d):
+            for k in sorted(d):
+                yield d[k]
+
+        return inner(self._array)
+
+    def __getitem__(self, key):
+        try:
+            return self._array[sparse_index(key)]
+
+        except KeyError:
+            raise IndexError
+
+    def __setitem__(self, key, value):
+        self._array[sparse_index(key)] = value
+        return
+
+    def __delitem__(self, key):
+        try:
+            del self._array[sparse_index(key)]
+
+        except KeyError:
+            raise IndexError
+
+        
 class AsgiTypeKeys(str, Enum):
     """
     Subclasses of this Enum associate ASGI events of a particular type with a specific
@@ -276,11 +330,11 @@ URL routing.
 """
 CAPTURE_PAT = re.compile(r"^<([a-zA-Z:]+)>$")
 BUILTIN_FILTERS = {
-    "path": r"(?:\w+/)*(?:\w+\.\w{1,6}){1}",
-    "any": r"[^/]+",
+    "static": r"^/([^/]+)",
+    "any": r"^/(?P<%s>[^/]+)",
     "int": r"\d+",
     "float": r"(?:\d*\.\d+)|(?:\d+\.\*)",
-    "static": r"^%s$",
+    "path": r"(?:\w+/)*(?:\w+\.\w{1,6}){1}",
     }
 
 
@@ -289,8 +343,6 @@ def eval_pattern(parsed, filters):
     if re_pat is None:
         try:
             re_pat = filters[re_name]
-            if re_name == "static":
-                re_pat %= name
 
         except KeyError:
             raise ValueError(f"Unknown filter name {parsed[1]}")
@@ -307,13 +359,8 @@ def eval_patterns(parsed_path, **filters):
     Return a list of Rules (either static or dynamic).
     """
     filters = filters | BUILTIN_FILTERS
-    rule_list = []
 
-    for path in parsed_path:
-        name, re_name, re_pat = eval_pattern(path, filters)
-        rule_list.append(Rule(name, re_name, re_pat))
-
-    return rule_list
+    return [eval_pattern(path, filters) for path in parsed_path]
 
 
 def parse_url_patterns(path):
@@ -341,6 +388,34 @@ def parse_url_patterns(path):
     return parsed
 
 
+
+def analyze_path(path, static_rules, patterns, dim):
+    """
+    Determine the key in a sparse array of routes for the given path.
+
+    Each index in the sparse array should contain either a string (
+    corresponds to a static rule), a number (each number corresponds
+    to one of the patterns that could match), or None (the path has
+    fewer components than the longest path represented in the table).
+    """
+    components = eval_patterns(parse_url_patterns(path))
+    index = [None] * dim
+
+    for i, component in enumerate(components):
+        if component[1] == "static":
+            static_rules.add(component[0])
+            index[i] = component[0]
+
+        elif component[-1] in patterns:
+            index[i] = patterns.index(component[-1])
+
+        else:
+            patterns.append(component[-1])
+            index[i] = len(patterns) - 1
+
+    return tuple(index)
+
+
 class NoMatch(BaseException):
     """
     Returned when a RuleTable can't match a supplied key.
@@ -348,134 +423,92 @@ class NoMatch(BaseException):
     pass
 
 
-class RuleTypes(str, Enum):
-    STATIC = "static"
-    DYNAMIC = "dynamic"
-
-
-class Rule:
-    """
-    A route matching rule, either static (literal comparison) or dynamic (regex matching)
-    """
-    STATIC = RuleTypes.STATIC
-    DYNAMIC = RuleTypes.DYNAMIC
-
-    def __init__(self, name, re_name, re_pat):
-        self.name = name
-        self._re_name = re_name
-        self._re_pat = re_pat
-
-    @cached_property
-    def key(self):
-        return self.name if self.is_static else self.re_pat
-
-    @cached_property
-    def ruletype(self):
-        return self.STATIC if self._re_name == "static" else self.DYNAMIC
-
-    @cached_property
-    def regex(self):
-        return re.compile(r"(?P<%s>%s)" % (self.name, self.pattern))
-
-    @cached_property
-    def is_static(self):
-        return self.ruletype is self.STATIC
-
-    @cached_property
-    def is_dynamic(self):
-        return self.ruletype is self.DYNAMIC
-
-    def __hash__(self):
-        return hash((self.ruletype, self._re_pat))
-
-    def match(self, string):
-        return (m := self.regex.match(string)) and m.groupdict()
-
-
 class RuleTable:
     """
-    Creates a table of rules for url routes.
+    Taking another crack at route matching.
+    """ 
+    STATIC_KEY = r"^/([^/]+)"
 
-    Implemented as a dictionary whose keys are rules.
-    
-    This class serves as a base class for two subclasses,
-    corresponding to static and dynamic rules.
-    """
-    STATIC = RuleTypes.STATIC
-    DYNAMIC = RuleTypes.DYNAMIC
+    def __init__(self, endpoint=NoMatch, /,):
+        self.patterns = self._init_patterns()
+        self.endpoint = NoMatch
 
-    def __init__(self, ruletype):
-        self.ruletype = ruletype
-        self.__rules = set([self.INDEX_RULE])      # The set of all rules in this table
-        self.__static = {"/": [self.INDEX_RULE, None]}
-        self.__dynamic = {v: [None, None] for v in BUILTIN_FILTERS.values()}
-        self.endpoint = None
+    @cached_property
+    def static(self):
+        return self.patterns[self.STATIC_KEY][-1]
 
-    # Abstract methods
-    def addrule(self, rule):
+    def __getitem__(self, string):
         """
-        Add a rule to the table.
+        This fairly complex method searches patterns in key insertion order
+        (this guarantees static will be looked up first, etc.).
         """
-        if rule in self.__rules:
-            return
+        if string in {"/", ""}:
+            return {}, self.endpoint
 
-        self.__rules.add(rule)
+        # Treat the static rule (guaranteed to be first) differently from others
+        items = iter(self.patterns.values())
+        p, r = next(items)
 
-        if rule.is_static:
-            self.__static[rule.key] = [rule, None]
+        if (m := p.match(string)):
+            try:
+                match = m[1]
+                rest = string[m.span()[1]:]
+                return r[match][rest]
+
+            except KeyError:
+                pass
+
+        for p, r in filter(None, items):
+            if (m := p.match(string)) is not None:
+                try:
+                    c = m.groupdict()
+                    rest = string[m.span()[1]:]
+                    captured, endpoint = r[rest]
+                    return c | captured, endpoint
+
+                except KeyError:
+                    continue
 
         else:
-            self.__dynamic[rule.key] = [rule, None]
+            return NoMatch
 
-    def getrule(self, rule):
-        if rule.is_static:
-            return self.__static[rule.key]
+    def __setitem__(self, path, endpoint):
+        """
+        Really an entry point for some sort of insert method.
+        """
+        rules = eval_patterns(parse_url_patterns(path))
+        try:
+            self._insert(endpoint, *rules)
 
-        else:
-            return self.__dynamic[rule.key]
+        except ValueError:
+            raise ValueError(f"Ambiguous matching for {path}: matched more than once.")
 
-    def setrule(self, rule, value):
-        ruleval = self.getrule(rule)
-        ruleval[-1] = value
-
-    def insert(self, endpoint, *rules):
+    def _insert(self, endpoint, *rules):
         if rules:
             rule, *rest = rules
+            name, re_name, re_pat = rule
 
-            if rule in self.__rules:
-                ruleval = self.getrule(rule)
-                if ruleval[-1] is None:
-                    ruleval[-1] = RuleTable()
+            if re_name == "static":
+                next_table = self.static.setdefault(name, RuleTable())
+                next_table._insert(endpoint, *rest)
 
-                child = ruleval[-1]
+            elif (t := self.patterns.get(re_pat)):
+                t[-1]._insert(endpoint, *rest)
 
             else:
-                child = RuleTable()
-                self.addrule(rule)
-                self.setrule(rule, child)
+                new = [re.compile(r"^/(?P<%s>%s)" % (name, re_pat)), RuleTable()]
+                self.patterns[re_pat] = new
+                new[-1]._insert(endpoint, *rest)
 
-            # apply recursively
-            child.insert(endpoint, rules)
+        elif self.endpoint is not NoMatch:
+            raise ValueError
 
         else:
             self.endpoint = endpoint
+            return
 
-        return self
+    def _init_patterns(self):
+        patterns = {v: None for v in BUILTIN_FILTERS.values()}
+        patterns[self.STATIC_KEY] = [re.compile(self.STATIC_KEY), {}]
 
-    def lookup(self, path, /, acc={}):
-        """
-        If path is the empty string, return the endpoint of the current ruletable.
-        
-        Otherwise, first try matching it to a static rule, then try matching it to
-        a dynamic route.
-        """
-        if path == "":
-            return self.endpoint
-
-        else:
-            prefix, sep, rest = path.partition("/")
-
-            if (result := self.__static.get(prefix)):
-                pass
-
-            
+        return patterns
