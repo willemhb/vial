@@ -5,10 +5,11 @@ requests, etc.
 """
 import re
 from functools import wraps, cached_property
-from itertools import chain, starmap
+from itertools import chain, starmap, zip_longest, filterfalse, tee
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
-from collections.abc import Mapping, MutableMapping, Set, MutableSet, Sequence, MutableSequence
+from collections import namedtuple
+from collections.abc import Mapping, MutableMapping, Set, MutableSet, Collection
 from typing import Union, Optional, Any, Iterable
 from http import HTTPStatus, cookies
 from urllib import parse
@@ -16,10 +17,46 @@ from enum import Enum
 
 
 """
+Iteration utilities.
+"""
+def interleave(*iters):
+    """
+    Yield elements from a group of iterables in index order, ie:
+
+    interleave([1,2,3],['a','b','c','d'])
+    """
+    values = zip_longest(*[iter(iters)]*len(iters))
+    lengths = [len(i) for i in iters]
+
+    for l, value in enumerate(values):
+        for i, item in enumerate(value):
+            if item is None and l > lengths[i]:
+                continue
+
+            else:
+                yield item
+
+
+def partition(pred, iterable):
+    """
+    Break set into elements that satisfy the predicate or don't.
+    """
+    t1, t2 = tee(iterable)
+    return filterfalse(pred, t1), filter(pred, t2)
+
+
+def distinct(iterable):
+    seen = set()
+
+    for element in iterable:
+        if element not in seen:
+            seen.add(element)
+            yield element
+
+
+"""
 Abstract data types.
 """
-
-
 class Model:
     """
     This simple model implementation uses dataclasses and the
@@ -264,53 +301,278 @@ def sparse_index(coll, dim):
     return tuple(filled)    
 
 
-class SparseArray(MutableSequence):
+class SparseArray(Collection):
     """
     Represents an array of arbitrary dimension that's mostly empty.
 
     Represented by a dict whose keys are tuples, where the 0-th item
     in the tuple represents the 0-th index, the 1st item represents the
     1st index, and so on.
+
+    This is a half-assed implementation of a sparse array; a more robust
+    implementation may be attempted in the future.
     """
-    def __init__(self, dim):
-        self._dim = dim  # represents the length of the key; a key can have fewer than than this,
-                         # but by defualt they're filled in with none
+    def __init__(self):
         self._array = dict()
 
     # general sequence functions
     def __len__(self):
-        return len(self._array.values())
+        return len(self._array)
 
     def __contains__(self, item):
         return item in self._array.values()
 
     # iteration functions
     def __iter__(self):
-        def inner(d):
-            for k in sorted(d):
-                yield d[k]
-
-        return inner(self._array)
+        return iter(self._array.values())
 
     def __getitem__(self, key):
         try:
-            return self._array[sparse_index(key)]
+            return self._array[tuple(key)]
 
         except KeyError:
             raise IndexError
 
     def __setitem__(self, key, value):
-        self._array[sparse_index(key)] = value
+        self._array[tuple(key)] = value
         return
 
     def __delitem__(self, key):
         try:
-            del self._array[sparse_index(key)]
+            del self._array[tuple(key)]
 
         except KeyError:
             raise IndexError
 
-        
+    def __repr__(self):
+        return f"SparseArray({repr(self._array)})"
+
+    __str__ = __repr__
+
+
+class BaseOrderedSet(Set):
+    """
+    Common base for OrderedSet and FrozenOrderedSet.
+
+    implementation details:
+
+        - Insertion order is not considered when comparing two ordered sets.
+
+        - Insertion order is maintained when a new ordered set is created by
+          merging two existing ordered sets.
+    """
+    def __init__(self, *args):
+        self._count = 0
+        self._backing = {}
+
+        for a in chain(*args):
+            self._backing.setdefault(a, self._count + 1)
+            self._count += 1
+
+    def _merge(self, other):
+        """
+        Return an interleaved iterator over two ordered sets.
+        """
+        return distinct(interleave(iter(self._backing), iter(other._backing)))
+
+    def index(self, key):
+        return self._backing[key]
+
+    # Basic iteration methods and general sequence methods
+    def __len__(self):
+        return len(self._backing)
+
+    def __contains__(self, element):
+        return element in self._backing
+
+    def __iter__(self):
+        return iter(self._backing)
+
+    # Set combination sunder methods (helpers for dunder methods)
+    def _andwise_(self, other):
+        return filter(lambda x: x in self and x in other, interleave(self, other))
+
+    def _orwise_(self, other):
+        return filter(lambda x: x in self or x in other, interleave(self, other))
+
+    def _xorwise_(self, other):  
+        return filter(lambda x: not (x in self and x in other), interleave(self, other))
+
+    def _diffwise_(self, other):
+        return filter(lambda x: x in self and x not in other, interleave(self, other))
+
+    # Set comparison methods
+    def __le__(self, other):
+        """Subset relation (self <= other)"""
+        for key in self._backing:
+            if key not in other:
+                return False
+
+        return True
+
+    def __lt__(self, other):
+        """Strict subset relation (self < other)"""
+        for key in self._backing:
+            if key not in other:
+                return False
+
+        return len(self) < len(other)
+
+    def __eq__(self, other):
+        for key in self._backing:
+            if key not in other:
+                return False
+
+        return True
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __gt__(self, other):
+        for key in other:
+            if key not in self._backing:
+                return False
+
+        return len(self) > len(other)
+
+    def __ge__(self, other):
+        for key in other:
+            if key not in self._backing:
+                return False
+
+        True
+
+    def __repr__(self):
+        return f"{type(self).__name__}({', '.join(self)})"
+
+    __str__ = __repr__
+
+
+class FrozenOrderedSet(BaseOrderedSet):
+    """
+    Hashable ordered set.
+    """
+    def __and__(self, other):
+        return FrozenOrderedSet(self._andwise_(other))
+
+    def __or__(self, other):
+        return FrozenOrderedSet(self._orwise_(other))
+
+    def __xor__(self, other):
+        return FrozenOrderedSet(self._xorwise_(other))
+
+    def __sub__(self, other):
+        return FrozenOrderedSet(self._diffwise_(other))
+
+    def isdisjoin(self, other):
+        for e in self:
+            if e in other:
+                return False
+
+        return True
+
+    def __hash__(self):
+        return hash(tuple([type(self), *self]))
+
+
+class OrderedSet(BaseOrderedSet):
+    """
+    A mutable set that preserves insertion order.
+    """
+    def add(self, item):
+        if item not in self._backing:
+            self._backing[item] = self._count
+            self._count += 1
+
+    def discard(self, item):
+        if item in self._backing:
+            del self._backing[item]
+
+    def remove(self, item):
+        if item not in self._backing:
+            raise KeyError
+
+        del self._backing[item]
+
+    def clear(self):
+        self._backing.clear()
+        self._count = 0
+
+    def pop(self):
+        try:
+            key, _ = self._backing.popitem()
+
+        except Exception:
+            raise KeyError
+
+        else:
+            return key
+
+    def recount(self):
+        """
+        Reset the key counts after modification.
+        """
+        for i, k in enumerate(self, start=1):
+            self._backing[k] = i
+
+        return
+
+    def __and__(self, other):
+        return OrderedSet(self._andwise_(other))
+
+    def __or__(self, other):
+        return OrderedSet(self._orwise_(other))
+
+    def __xor__(self, other):
+        return OrderedSet(self._xorwise_(other))
+
+    def __sub__(self, other):
+        return OrderedSet(self._diffwise_(other))
+    
+    def isdisjoin(self, other):
+        for e in self:
+            if e in other:
+                return False
+
+        return True
+
+    # In place set combinations
+    def __ior__(self, other):
+        for item in other:
+            self.add(item)
+
+    def __iand__(self, other):
+        for element in other:
+            if element not in self:
+                self.remove(item)
+
+    def __ixor__(self, other):
+        for element in other:
+            if element in self:
+                self.remove(element)
+
+            else:
+                self.add(element)
+
+    def __isub__(self, other):
+        for element in other:
+            if element in self:
+                self.remove(element)
+
+
+class RuleTable:
+    """
+    Stores all of the rule information associated with a routing table. 
+
+    Instance attributes:
+
+    static_names - a set of str representing all of the unique static names handled
+                   by the routing table.
+    patterns     - an ordered set of all the patterns used by the routes in this table.
+
+    captures     - a set of all the 
+    """
+
 class AsgiTypeKeys(str, Enum):
     """
     Subclasses of this Enum associate ASGI events of a particular type with a specific
