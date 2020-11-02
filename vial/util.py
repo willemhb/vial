@@ -272,9 +272,7 @@ class SparseArray(MutableSequence):
     in the tuple represents the 0-th index, the 1st item represents the
     1st index, and so on.
     """
-    def __init__(self, dim):
-        self._dim = dim  # represents the length of the key; a key can have fewer than than this,
-                         # but by defualt they're filled in with none
+    def __init__(self):
         self._array = dict()
 
     # general sequence functions
