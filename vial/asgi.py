@@ -3,18 +3,19 @@ The classes in this module are intended primarily to provide an interface
 to the ASGI standard, or otherwise to assist with implementing the spec.
 """
 from dataclasses import dataclass
-from typing import Iterable, Optional, TypedDict
-from .datastructures import AsgiTypeKeys
+from itertools import starmap
+from typing import Union, Iterable, Optional, TypedDict
 from enum import Enum
-
+from http.cookies import SimpleCookie
+from vial.util import MultiDict
 
 """
 Typedefs.
 """
-
-Headers = Iterable[tuple[bytes, bytes]]
-
-
+Json = Union[Iterable, dict, str, bytes, bool, int, float] # ie, serializable
+ASGIStr = Union[str, bytes]
+RawHeaders = Iterable[Iterable[bytes, bytes]]
+Headers = Union[RawHeaders, MultiDict[ASGIStr, Json]]
 """
 Exception classes.
 """
@@ -22,6 +23,95 @@ Exception classes.
 
 class ASGIError(Exception):
     pass
+
+
+"""
+Helper classes.
+"""
+
+
+@dataclass
+class ConnectionState:
+    """
+    Represents all of the state information associated with
+    an HTTP connection.
+    """
+    scope: dict
+    # application info
+    started: bool = False
+    finished: bool = False
+
+    # these attributes hold request data
+    req_headers: Headers = MultiDict()
+    req_body: bytes = b""
+    more_req_body: bool = True
+
+    # these attributes hold response data
+    resp_headers: Headers = MultiDict()
+    cookies: SimpleCookie = SimpleCookie()
+    status: int = 200
+    resp_body: bytes = b""
+    more_resp_body: bool = True
+    received_body_length: int = 0
+
+    def __post_init__(self):
+        self.read_request_headers()
+
+    def read_request_headers(self):
+        """
+        Send the request headers from the scope to self.req_headers.
+        """
+        decoded = starmap(lambda a, b: a.decode(), b.decode(), self.scope["headers"])
+        self.req_headers.update(decoded)
+
+    def read_event(self, event):
+        """
+        Interpret the event and update the connection state.
+
+        Assumes that invalid events have already been taken care
+        of.
+        """
+        if event["type"] == "http.request":
+            if not self.started:
+                self.started = True
+
+            self.req_body += event["body"]
+
+            if not event["more_body"]:
+                self.more_req_body = False
+
+        elif event["type"] == "http.response.start":
+            self.status = event["status"]
+            self.headers.update(event["headers"])
+            
+
+        elif event["type"] == "http.response.body":
+            self.resp_body += event["body"]
+            self.received_body_length += len(event["body"])
+
+            if not event["more_body"]:
+                self.more_resp_body = False
+                self.headers["content-length"] = self.received_body_length
+                self.finished = True
+
+        else:
+            return
+
+
+class AsgiTypeKeys(str, Enum):
+    """
+    Subclasses of this Enum associate ASGI events of a particular type with a specific
+    Typed dict callable.
+    """
+    def __new__(cls, value, evt_dct_cls):
+        """
+        The actual value is the first argument, the .
+        """
+        obj = str.__new__(cls, value)
+        obj._value_ = value
+        obj._evt_cls = evt_dct_cls
+        return obj
+
 
 
 class HTTPResponse(BaseException):
@@ -263,20 +353,3 @@ class HTTPEventHandler(BaseEventHandler):
 
             else:
                 raise ASGIError(f"Unknown http event type {event['type']}")
-
-
-class WebSocketEventHandler(BaseEventHandler):
-    """
-    Handles WebSocket event messages.
-    """
-    def __init__(self, receive, send):
-        super().__init__(self, receive, send)
-
-        # set up local state
-        self._connected = True
-
-    async def receive(self):
-        pass
-
-    async def send(self, event):
-        pass

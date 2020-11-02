@@ -5,10 +5,11 @@ requests, etc.
 """
 import re
 from functools import wraps, cached_property
-from itertools import chain, starmap
+from itertools import chain, starmap, zip_longest, filterfalse, tee
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
-from collections.abc import Mapping, MutableMapping, Set, MutableSet, Sequence, MutableSequence
+from collections import namedtuple
+from collections.abc import Mapping, MutableMapping, Set, MutableSet, Collection
 from typing import Union, Optional, Any, Iterable
 from http import HTTPStatus, cookies
 from urllib import parse
@@ -16,10 +17,46 @@ from enum import Enum
 
 
 """
+Iteration utilities.
+"""
+def interleave(*iters):
+    """
+    Yield elements from a group of iterables in index order, ie:
+
+    interleave([1,2,3],['a','b','c','d'])
+    """
+    values = zip_longest(*[iter(iters)]*len(iters))
+    lengths = [len(i) for i in iters]
+
+    for l, value in enumerate(values):
+        for i, item in enumerate(value):
+            if item is None and l > lengths[i]:
+                continue
+
+            else:
+                yield item
+
+
+def partition(pred, iterable):
+    """
+    Break set into elements that satisfy the predicate or don't.
+    """
+    t1, t2 = tee(iterable)
+    return filterfalse(pred, t1), filter(pred, t2)
+
+
+def distinct(iterable):
+    seen = set()
+
+    for element in iterable:
+        if element not in seen:
+            seen.add(element)
+            yield element
+
+
+"""
 Abstract data types.
 """
-
-
 class Model:
     """
     This simple model implementation uses dataclasses and the
@@ -264,154 +301,318 @@ def sparse_index(coll, dim):
     return tuple(filled)    
 
 
-class SparseArray(MutableSequence):
+class SparseArray(Collection):
     """
     Represents an array of arbitrary dimension that's mostly empty.
 
     Represented by a dict whose keys are tuples, where the 0-th item
     in the tuple represents the 0-th index, the 1st item represents the
     1st index, and so on.
+
+    This is a half-assed implementation of a sparse array; a more robust
+    implementation may be attempted in the future.
     """
     def __init__(self):
         self._array = dict()
 
+    def hasindex(self, index):
+        return tuple(index) in self._array
+
     # general sequence functions
     def __len__(self):
-        return len(self._array.values())
+        return len(self._array)
 
     def __contains__(self, item):
         return item in self._array.values()
 
     # iteration functions
     def __iter__(self):
-        def inner(d):
-            for k in sorted(d):
-                yield d[k]
+        return iter(self._array.values())
 
-        return inner(self._array)
+    def items(self):
+        return self._array.items()
 
     def __getitem__(self, key):
         try:
-            return self._array[sparse_index(key)]
+            return self._array[tuple(key)]
 
         except KeyError:
             raise IndexError
 
     def __setitem__(self, key, value):
-        self._array[sparse_index(key)] = value
+        self._array[tuple(key)] = value
         return
 
     def __delitem__(self, key):
         try:
-            del self._array[sparse_index(key)]
+            del self._array[tuple(key)]
 
         except KeyError:
             raise IndexError
 
-        
-class AsgiTypeKeys(str, Enum):
+    def __repr__(self):
+        return f"SparseArray({repr(self._array)})"
+
+    __str__ = __repr__
+
+
+class BaseOrderedSet(Set):
     """
-    Subclasses of this Enum associate ASGI events of a particular type with a specific
-    Typed dict callable.
+    Common base for OrderedSet and FrozenOrderedSet.
+
+    implementation details:
+
+        - Insertion order is not considered when comparing two ordered sets.
+
+        - Insertion order is maintained when a new ordered set is created by
+          merging two existing ordered sets.
     """
-    def __new__(cls, value, evt_dct_cls):
+    def __init__(self, *args):
+        self._count = 0
+        self._backing = {}
+
+        for a in chain(*args):
+            self._backing.setdefault(a, self._count + 1)
+            self._count += 1
+
+    def _merge(self, other):
         """
-        The actual value is the first argument, the .
+        Return an interleaved iterator over two ordered sets.
         """
-        obj = str.__new__(cls, value)
-        obj._value_ = value
-        obj._evt_cls = evt_dct_cls
-        return obj
+        return distinct(interleave(iter(self._backing), iter(other._backing)))
+
+    def index(self, key):
+        return self._backing[key]
+
+    # Basic iteration methods and general sequence methods
+    def __len__(self):
+        return len(self._backing)
+
+    def __contains__(self, element):
+        return element in self._backing
+
+    def __iter__(self):
+        return iter(self._backing)
+
+    # Set combination sunder methods (helpers for dunder methods)
+    def _andwise_(self, other):
+        return filter(lambda x: x in self and x in other, interleave(self, other))
+
+    def _orwise_(self, other):
+        return filter(lambda x: x in self or x in other, interleave(self, other))
+
+    def _xorwise_(self, other):  
+        return filter(lambda x: not (x in self and x in other), interleave(self, other))
+
+    def _diffwise_(self, other):
+        return filter(lambda x: x in self and x not in other, interleave(self, other))
+
+    # Set comparison methods
+    def __le__(self, other):
+        """Subset relation (self <= other)"""
+        for key in self._backing:
+            if key not in other:
+                return False
+
+        return True
+
+    def __lt__(self, other):
+        """Strict subset relation (self < other)"""
+        for key in self._backing:
+            if key not in other:
+                return False
+
+        return len(self) < len(other)
+
+    def __eq__(self, other):
+        for key in self._backing:
+            if key not in other:
+                return False
+
+        return True
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __gt__(self, other):
+        for key in other:
+            if key not in self._backing:
+                return False
+
+        return len(self) > len(other)
+
+    def __ge__(self, other):
+        for key in other:
+            if key not in self._backing:
+                return False
+
+        True
+
+    def __repr__(self):
+        return f"{type(self).__name__}({', '.join(self)})"
+
+    __str__ = __repr__
+
+
+class FrozenOrderedSet(BaseOrderedSet):
+    """
+    Hashable ordered set.
+    """
+    def __and__(self, other):
+        return FrozenOrderedSet(self._andwise_(other))
+
+    def __or__(self, other):
+        return FrozenOrderedSet(self._orwise_(other))
+
+    def __xor__(self, other):
+        return FrozenOrderedSet(self._xorwise_(other))
+
+    def __sub__(self, other):
+        return FrozenOrderedSet(self._diffwise_(other))
+
+    def isdisjoin(self, other):
+        for e in self:
+            if e in other:
+                return False
+
+        return True
+
+    def __hash__(self):
+        return hash(tuple([type(self), *self]))
+
+
+class OrderedSet(BaseOrderedSet):
+    """
+    A mutable set that preserves insertion order.
+    """
+    def add(self, item):
+        if item not in self._backing:
+            self._backing[item] = self._count
+            self._count += 1
+
+    def discard(self, item):
+        if item in self._backing:
+            del self._backing[item]
+
+    def remove(self, item):
+        if item not in self._backing:
+            raise KeyError
+
+        del self._backing[item]
+
+    def clear(self):
+        self._backing.clear()
+        self._count = 0
+
+    def pop(self):
+        try:
+            key, _ = self._backing.popitem()
+
+        except Exception:
+            raise KeyError
+
+        else:
+            return key
+
+    def recount(self):
+        """
+        Reset the key counts after modification.
+        """
+        for i, k in enumerate(self, start=1):
+            self._backing[k] = i
+
+        return
+
+    def __and__(self, other):
+        return OrderedSet(self._andwise_(other))
+
+    def __or__(self, other):
+        return OrderedSet(self._orwise_(other))
+
+    def __xor__(self, other):
+        return OrderedSet(self._xorwise_(other))
+
+    def __sub__(self, other):
+        return OrderedSet(self._diffwise_(other))
+    
+    def isdisjoin(self, other):
+        for e in self:
+            if e in other:
+                return False
+
+        return True
+
+    # In place set combinations
+    def __ior__(self, other):
+        for item in other:
+            self.add(item)
+
+    def __iand__(self, other):
+        for element in other:
+            if element not in self:
+                self.remove(item)
+
+    def __ixor__(self, other):
+        for element in other:
+            if element in self:
+                self.remove(element)
+
+            else:
+                self.add(element)
+
+    def __isub__(self, other):
+        for element in other:
+            if element in self:
+                self.remove(element)
+
 
 """
 URL routing.
 """
-CAPTURE_PAT = re.compile(r"^<([a-zA-Z:]+)>$")
-BUILTIN_FILTERS = {
-    "static": r"^/([^/]+)",
-    "any": r"^/(?P<%s>[^/]+)",
-    "int": r"\d+",
-    "float": r"(?:\d*\.\d+)|(?:\d+\.\*)",
-    "path": r"(?:\w+/)*(?:\w+\.\w{1,6}){1}",
-    }
+CAPTURE_GROUP_PAT = r"<([^>]+)>"
+CAPTURING_PAT = r"[^/]+"
 
+def expand_route(route):
+    """
+    Replace capture groups with their corresponding regular expressions,
+    keeping a record of the capture names (these will later be used to match
+    names to arguments when the route function is called).
+    """
+    names = []
+    index = []
 
-def eval_pattern(parsed, filters):
-    name, re_name, re_pat = parsed
-    if re_pat is None:
-        try:
-            re_pat = filters[re_name]
+    new_route = re.sub(CAPTURE_GROUP_PAT, CAPTURING_PAT, route)
 
-        except KeyError:
-            raise ValueError(f"Unknown filter name {parsed[1]}")
+    for route_part in route.strip("/").split("/"):
+        if route_part.startswith("<"):
+            names.append(route_part[1:-1])
+            index.append("__matching__")
 
         else:
-            return [name, re_name, re_pat]
+            index.append(route_part)
+            names.append(None)  # Put a dummy into the list of names for all static names
 
-    else:
-        return parsed
+    return names, tuple(index), new_route.format(*[r"[^/]+"] * len(names))
 
 
-def eval_patterns(parsed_path, **filters):
+def parse_route(route, static_names):
     """
-    Return a list of Rules (either static or dynamic).
+    Return an index suitable for use in a SparseArray of routes.
     """
-    filters = filters | BUILTIN_FILTERS
+    index = []
+    captured = []
 
-    return [eval_pattern(path, filters) for path in parsed_path]
+    route_parts = route.strip("/").split("/")
 
-
-def parse_url_patterns(path):
-    """
-    Accept a URL pattern and parse it into its static and pattern-based elements.
-    """
-    components = path.strip("/").split("/")
-    parsed = []
-
-    for c in components:
-        if (m := CAPTURE_PAT.match(c)):
-            split = m[1].split(":")
-
-            if len(split) == 1:
-                split.extend(["any", None])
-
-            elif len(split) == 2:
-                split.append(None)
-
-            parsed.append(split)
+    for route_part in route_parts:
+        if route_part not in static_names:
+            index.append("__matching__")
+            captured.append(route_part)
 
         else:
-            parsed.append([c, "static", None])
+            index.append(route_part)
 
-    return parsed
-
-
-
-def analyze_path(path, static_rules, patterns, dim):
-    """
-    Determine the key in a sparse array of routes for the given path.
-
-    Each index in the sparse array should contain either a string (
-    corresponds to a static rule), a number (each number corresponds
-    to one of the patterns that could match), or None (the path has
-    fewer components than the longest path represented in the table).
-    """
-    components = eval_patterns(parse_url_patterns(path))
-    index = [None] * dim
-
-    for i, component in enumerate(components):
-        if component[1] == "static":
-            static_rules.add(component[0])
-            index[i] = component[0]
-
-        elif component[-1] in patterns:
-            index[i] = patterns.index(component[-1])
-
-        else:
-            patterns.append(component[-1])
-            index[i] = len(patterns) - 1
-
-    return tuple(index)
+    return captured, tuple(index)
 
 
 class NoMatch(BaseException):
@@ -423,90 +624,41 @@ class NoMatch(BaseException):
 
 class RuleTable:
     """
-    Taking another crack at route matching.
-    """ 
-    STATIC_KEY = r"^/([^/]+)"
+    Stores all of the rule information associated with a routing table. 
 
-    def __init__(self, endpoint=NoMatch, /,):
-        self.patterns = self._init_patterns()
-        self.endpoint = NoMatch
+    Instance attributes:
 
-    @cached_property
-    def static(self):
-        return self.patterns[self.STATIC_KEY][-1]
-
-    def __getitem__(self, string):
-        """
-        This fairly complex method searches patterns in key insertion order
-        (this guarantees static will be looked up first, etc.).
-        """
-        if string in {"/", ""}:
-            return {}, self.endpoint
-
-        # Treat the static rule (guaranteed to be first) differently from others
-        items = iter(self.patterns.values())
-        p, r = next(items)
-
-        if (m := p.match(string)):
-            try:
-                match = m[1]
-                rest = string[m.span()[1]:]
-                return r[match][rest]
-
-            except KeyError:
-                pass
-
-        for p, r in filter(None, items):
-            if (m := p.match(string)) is not None:
-                try:
-                    c = m.groupdict()
-                    rest = string[m.span()[1]:]
-                    captured, endpoint = r[rest]
-                    return c | captured, endpoint
-
-                except KeyError:
-                    continue
-
-        else:
-            return NoMatch
+    static_names - a set of str representing all of the unique static names handled
+                   by the routing table.
+    patterns     - an ordered set of all the patterns used by the routes in this table.
+    endpoints    - a sparse array of all of the endpoints mapped by this table.
+    """
+    def __init__(self):
+        self.static_names = set()
+        self.endpoints = SparseArray()
 
     def __setitem__(self, path, endpoint):
-        """
-        Really an entry point for some sort of insert method.
-        """
-        rules = eval_patterns(parse_url_patterns(path))
+        names, index, expanded_path = expand_route(path)
+        for element in index:
+            if element != "__matching__":
+                self.static_names.add(element)
+
+        endpoint.capture_groups = names
+        endpoint.expanded_path = expanded_path
+
+        if index in self.endpoints:
+            raise TypeError(f"Ambiguous route patterns: {expanded_path} matched twice.")
+
+        self.endpoints[index] = endpoint
+
+    def __getitem__(self, path):
+        captured_items, index = parse_route(path, self.static_names)
+
         try:
-            self._insert(endpoint, *rules)
+            return captured_items, self.endpoints[index]
 
-        except ValueError:
-            raise ValueError(f"Ambiguous matching for {path}: matched more than once.")
+        except KeyError:
+            raise NoMatch("Couldn't match supplied url to an existing endpoint.")
 
-    def _insert(self, endpoint, *rules):
-        if rules:
-            rule, *rest = rules
-            name, re_name, re_pat = rule
-
-            if re_name == "static":
-                next_table = self.static.setdefault(name, RuleTable())
-                next_table._insert(endpoint, *rest)
-
-            elif (t := self.patterns.get(re_pat)):
-                t[-1]._insert(endpoint, *rest)
-
-            else:
-                new = [re.compile(r"^/(?P<%s>%s)" % (name, re_pat)), RuleTable()]
-                self.patterns[re_pat] = new
-                new[-1]._insert(endpoint, *rest)
-
-        elif self.endpoint is not NoMatch:
-            raise ValueError
-
-        else:
-            self.endpoint = endpoint
-            return
-
-    def _init_patterns(self):
-        patterns = {v: None for v in BUILTIN_FILTERS.values()}
-        patterns[self.STATIC_KEY] = [re.compile(self.STATIC_KEY), {}]
-
-        return patterns
+    def __repr__(self):
+        return f"RuleTable({', '.join(starmap('{}: {}'.format, self.endpoints.items()))})"
