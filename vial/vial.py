@@ -25,8 +25,9 @@ It provides:
     - An interface to Jinja2 templates.
 """
 from functools import cached_property
-from vial.asgi import HTTPResponse, HTTPError
-from vial.datastructures import RouteTable
+from vial.asgi import ConnectionState, HTTPResponse, HTTPError
+from vial.util import RuleTable, MultiDict, NoMatch
+from typing import Callable
 
 """
 Exception classes.
@@ -35,11 +36,6 @@ class VialException(Exception):
     def __init__(self, *args, status=500, **kwargs):
         super().__init__(self, *args, **kwargs)
         self.status = status
-
-
-class PluginException(VialException):
-    pass
-
 
 """
 Main application class.
@@ -54,23 +50,10 @@ class Vial:
     The Vial class also handles lifespan events (most Protocols are handled
     by specialized Event handling subclasses).
     """
-    def __init__(self, config, routes, plugins, **more_config):
+    def __init__(self, config, routes, **more_config):
         self.config = config | more_config
-        self.routes = RouteTable(routes)
-        self.plugins = [ServerErrorPlugin, *plugins, RedirectPlugin, ExceptionPlugin]
-        self.app = self._setup_app_stack()
-
-    def _setup_app_stack(self):
-        """
-        Create a chain of Plugins and applications set up to call each other.
-        """
-        app = self.routes
-
-        for cls in reversed(self.plugins):
-            app = plugin(cls)
-
-        # assert: the final value is a chain of plugins ending at the router
-        return app
+        self.routes = Router(routes)
+        self.app = self.routes
 
     async def __call__(self, scope, receive, send):
         """
@@ -90,16 +73,12 @@ class Vial:
         """
         Handle lifespan events (app initialization).
         """
-        self.routes = Router(routes)
-        self.app = self._stack_plugins()
-
         while True:
             message = await receive()
 
             if message['type'] == 'lifespan.startup':
                 try:
-                    for plugin in self.plugins:
-                        await plugin.start()
+                    await self.router.start()
 
                 except Exception as e:
                     message = {
@@ -117,8 +96,7 @@ class Vial:
 
             elif message['type'] == 'lifespan.shutdown':
                 try:
-                    for plugin in self.plugins:
-                        await plugin.close()
+                    await self.router.close()
 
                 except Exception as e:
                     message = {
@@ -162,12 +140,23 @@ class Connection:
 
     async def app(conn):
     """
-    def __init__(self, config, scope, receive, send):
+    def __init__(self, config: dict, scope: dict, receive: Callable, send: Callable):
         # Actual ASGI callables
         self.config = config
         self.scope = scope
         self.receive = receive
         self.send = send
+
+        # Connection state
+        self.state = ConnectionState(self.scope)
+
+    @cached_property
+    def req_headers(self):
+        return self.state.req_headers
+
+    @cached_property
+    def resp_headers(self):
+        return self.state.resp_headers
 
     async def __call__(self, event=None, /,):
         """
@@ -182,274 +171,73 @@ class Connection:
             await self.send(event)
             return
 
-    def __getitem__(self, key):
-        """
-        Getitem can be used to access items from the scope.
-        """
-        return self.scope[key]
-
-    def __setitem__(self, key, value):
-        """
-        Symmetrical to __getitem__.
-        """
-        self.scope[key] = value
-
 
 """
 Application base class.
 """
 
-
 class Application:
     async def __call__(self, conn):
         raise NotImplementedError("Classes must override this method.")
 
-"""
-Endpoint classes.
 
-Endpoints wrap application code and convert their responses into ASGI-compatible events.
-
-Routes are a subclass of endpoints.
-"""
-
-
-class Endpoint(Application):
+class Route(Application):
     """
-    Endpoint base class.
+    Route decorator class.
 
-    Endpoints wrap regular Python functions (functions that return or 
-    yield values) and convert them into appropriate ASGI events.
+    Extremely bare bones implementation right now, trying to get a basic
+    implementation finished.
     """
-    async def __call__(self, conn):
-        pass
+    def __init__(self, endpoint, route):
+        self.endpoint = endpoint
+        self._raw_route = route
+
+    def _match_captured_values(self, captured):
+        """
+        Match the captured path parameters to.
+        """
+        return dict(zip(filter(None, self.capture_groups), captured))
+
+    async def __call__(self, conn, *captured):
+        mapping = self._match_captured_values(captured)
+        result = await self.endpoint(conn, *mapping)
+        return result
 
 
-class Route(Endpoint):
+class Router(Application):
     """
-    .
+    Instances of the router class manage a RouteTable (implemented using RuleTable)
+    whose endpoints are Routes.
     """
-
-
-
-class Plugin(Application):
-    """
-    Plugins are optional components that can be added to an application and either:
-
-    1) Make certain resources or features available when called for.
-
-    2) Modify the scope of an ASGI connection, possibly preempting the rest of
-       the application and raising an error.
-
-    Plugins are meant to provide a way of implementing both ASGI middleware
-    and a plugin interface similar to Bottles' Plugin API. A Plugin that applies to
-    all events of a given scope can be considered middleware.
-    """
-    def __init_subclass__(cls, **kwargs):
+    def __init__(self, routes):
         """
-        Set the scopes and events this plugin applies to. The special name '*'
-        means 'all scopes' or 'all events'.
+        Initialize the RuleTable and set up routes.
         """
-        super().__init_subclass__(cls, **kwargs)
-
-        if hasattr(cls, "Config"):
-            cls.scopes = getattr(cls.Config, "scopes", ["*"])
-            cls.events = getattr(cls.Config, "events", ["*"])
-            cls.headers = getattr(cls.Config, "headers", [])
-
-        else:
-            cls.scopes = ["*"]
-            cls.events = ["*"]
-            cls.headers = []
-
-        cls.scopes = set(cls.scopes)
-        cls.events = set(cls.events)
-        cls.headers = set(map(lambda s: s.encode("utf-8"), cls.headers))
-
-
-    def __init__(self, app):
-        self.app = app
-
-    def check(self, conn):
-        """
-        Check if this Plugin should be applied to the connection.
-        
-        This method can be overridden to implement custom logic.
-        
-        The default check method will return True if the connection
-        scope is among the scopes in self and all of its required
-        headers (possibly None) are among the connection's headers.
-        """
-        for s in self.scopes:
-            if s == "*" or conn["type"] == s:
-                break
-        else:
-            return False
-
-        for h in self.headers:
-            if h not in conn.header_names:
-                return False
-
-        else:
-            return True
-
-
-    async def apply(self, conn):
-        """
-        This method has no default behavior and must be overridden by subclasses.
-
-        All changes to the connection scope should be applied through this method.
-        """
-        pass
+        self.routes = routes
+        self._table = RuleTable()
 
     async def __call__(self, conn):
         """
-        This method checks if the plugin should be applied to conn. If yes, it calls
-        its apply method. If no, it does nothing. Either way, it calls its inner
-        application, passing conn (which may or may not have had its scope, send, or
-        receive methods modified by self).
-
-        The __call__ method should be overridden if:
-
-            1) The Plugin wants to raise an Exception when validation fails.
-
-            2) The Plugin wants to wrap the inner application with exception handling.
-
-            3) It wants to do something uncoditionally.
-
-            4) Any combination of the above.
+        Try to match the supplied URL to a rule in the router's rule table.
         """
-        if self.check(conn):
-            await self.apply(conn)
+        url = conn.path
+        captured, route = self._table[url]
+        result = await route(conn, *captured)
+        await self.handle_result(conn, result)
+        return
 
-        await self.app(conn)
+    async def handle_result(self, conn, result):
+        """
+        Converts the result from the endpoint into a message and sends
+        it over the connection.
+        """
+        pass
 
     async def start(self):
-        """
-        This method should check that the application the plugin was initialized with
-        implements the required scopes and events. It should then initialize the resources
-        it needs (for a database plugin, this would be a database connection). 
+        for route in self.routes:
+            self._table[route._raw_route] = route
 
-        If any of the above steps fails, the start method should raise an exception.
-        """
         return
 
     async def close(self):
-        """
-        This method should clean up any resources it depends on and return None if
-        everything went okay. Otherwise it should raise an exception.
-        """
         return
-
-"""
-Builtin Plugin classes (these are absolutely necessary for an application to run
-reliably, and they are included by default).
-"""
-class ServerErrorPlugin(Plugin):
-    pass
-
-
-class TrustedHostPlugin(Plugin):
-    pass
-
-
-class RedirectPlugin(Plugin):
-    """
-    Wraps the application-side code with redirect handling.
-    """
-    class Config:
-        scopes = ["http"]
-
-    async def __call__(self, conn):
-        try:
-            await self.app(conn)
-
-        except HTTPResponse as r:
-            if 300 <= r.status <= 309:
-                pass
-
-            else:
-                raise r
-
-
-
-class ExceptionPlugin(Plugin):
-    """
-    Wraps the application-side code with error handling.
-    """
-    pass
-
-
-"""
-Authentication and session plugins are also provided as part of the base library.
-"""
-class SessionPlugin(Plugin):
-    pass
-
-class AuthenticationPlugin(Plugin):
-    pass
-
-"""
-Route decorating helpers.
-"""
-
-def route(path, methods):
-    """
-    Return a wrapper that creates a new Route object for the wrapped function. The wrapper
-    returns the undecorated function to enable decorator stacking.
-    """
-    def wrapper(func):
-        pass
-
-    return wrapper
-
-
-"""
-Redirecting functions.
-
-These functions implement simple (300-range) or error-based (400-range)
-redirects. They are analogues to Bottles' `redirect` and `abort` functions.
-"""
-def redirect(url, status=301, headers={}, **more_headers):
-    headers = headers | more_headers | {"Location": url}
-    raise HTTPResponse(status, headers=headers)
-
-
-def abort(status, message=None, headers={}, **more_headers):
-    headers = headers | more_headers
-    
-
-"""
-Rendering (templates and static files).
-"""
-
-
-def template(tpl, **ctx):
-    """
-    Render the template named 'tpl' with the given context variables.
-    """
-
-
-    
-
-"""
-Content types.
-
-These Content type classes employ some methods, but mostly exist to support
-type hinting the return type from route decorators.
-"""
-
-
-class Text:
-    pass
-
-
-class Json:
-    pass
-
-
-class Html:
-    pass
-
-
-class Xml:
-    pass
