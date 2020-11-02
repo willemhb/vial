@@ -569,8 +569,44 @@ class OrderedSet(BaseOrderedSet):
 """
 URL routing.
 """
-CAPTURE_GROUP_PAT = r"<([^>]+)>"
-CAPTURING_PAT = r"[^/]+"
+CAPTURE_GROUP_PAT = r"<([\w\d_]+){1}(?::([\w\d_]+))?(?(2):([\w\d_]+))?>"
+NAMED_CAPTURING_PAT = r"(?P<%s>%s)"
+MATCH_INT_PAT = r"-?\d+"
+MATCH_FLOAT_PAT = r"-?[\d.]+"
+MATCH_TO_SLASH_PAT = r"[^/]+"
+MATCH_PATH_PAT = r".+?"
+
+
+FILTERS = {
+    "int": MATCH_INT_PAT,
+    "float": MATCH_FLOAT_PAT,
+    "any": MATCH_TO_SLASH_PAT,
+    "path": MATCH_PATH_PAT,
+}
+
+
+def process_route(route):
+    """
+    Remove capturing groups and replace them with placeholders.
+    """
+    new_route = re.sub(CAPTURE_GROUP_PAT, "{}", route)
+    capture_groups = re.findall(CAPTURE_GROUP_PAT, route)
+    patterns = []
+
+    for name, re_name, re_pat in capture_groups:
+        if re_name == '' and re_pat == '':
+            patterns.append(NAMED_CAPTURING_PAT % (name, MATCH_TO_SLASH_PAT))
+
+        elif re_pat == '' and re_name:
+            patterns.append(NAMED_CAPTURING_PAT % (name, FILTERS.get(re_name)))
+
+        else:
+            patterns.append(NAMED_CAPTURING_PAT % (name, re_pat))
+
+    new_route = new_route.format(*patterns)
+
+    return "^%s$" % new_route
+
 
 def expand_route(route):
     """
@@ -581,7 +617,7 @@ def expand_route(route):
     names = []
     index = []
 
-    new_route = re.sub(CAPTURE_GROUP_PAT, CAPTURING_PAT, route)
+    new_route = re.sub(CAPTURE_GROUP_PAT, "{}", route)
 
     for route_part in route.strip("/").split("/"):
         if route_part.startswith("<"):
