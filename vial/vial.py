@@ -24,10 +24,14 @@ It provides:
 
     - An interface to Jinja2 templates.
 """
+import sys, os, getopt, inspect
 from functools import cached_property
-from vial.asgi import ConnectionState, HTTPResponse, HTTPError
-from vial.util import RuleTable, MultiDict, NoMatch
-from typing import Callable
+from vial.asgi import (HTTPConnectionState, WebSocketConnectionState,
+                       HTTPResponse, HTTPError, HTTPEventHandler,
+                       WebSocketEventHandler)
+from vial.util import RuleTable, MultiDict, Config, NoMatch, process_route
+from typing import Callable, Union, Optional
+from urllib.parse import parse_qsl, unquote_plus
 
 """
 Exception classes.
@@ -50,10 +54,10 @@ class Vial:
     The Vial class also handles lifespan events (most Protocols are handled
     by specialized Event handling subclasses).
     """
-    def __init__(self, config, routes, **more_config):
-        self.config = config | more_config
-        self.routes = Router(routes)
-        self.app = self.routes
+    def __init__(self, config, routes):
+        self.config = config
+        self.router = Router(routes)
+        self.app = self.router
 
     async def __call__(self, scope, receive, send):
         """
@@ -85,7 +89,7 @@ class Vial:
                         "type": "lifespan.startup.failed",
                         "message": str(e),
                     }
-                    
+
                 else:
                     message = {
                         'type': 'lifespan.startup.complete',
@@ -140,37 +144,42 @@ class Connection:
 
     async def app(conn):
     """
+    HANDLERS = {
+        "http": HTTPEventHandler,
+        "websocket": WebSocketEventHandler,
+    }
+
     def __init__(self, config: dict, scope: dict, receive: Callable, send: Callable):
         # Actual ASGI callables
         self.config = config
         self.scope = scope
-        self.receive = receive
-        self.send = send
+        self.handler = self.HANDLERS[scope["type"]](scope, receive, send)
 
-        # Connection state
-        self.state = ConnectionState(self.scope)
+    @cached_property
+    def state(self):
+        return self.handler.state
 
     @cached_property
     def req_headers(self):
-        return self.state.req_headers
+        header_pairs = self.scope["headers"].items()
+        return MultiDict(starmap(lambda a, b: (a.decode(), b.decode()), header_pairs))
 
     @cached_property
-    def resp_headers(self):
-        return self.state.resp_headers
+    def query(self):
+        query_string = self.scope["query_string"].decode()
+        return MultiDict(parse_qsl(unquote_plus(query_string)))
 
-    async def __call__(self, event=None, /,):
+    async def __call__(self, *args, **kwargs):
         """
         Dispatch to either self.receive or self.send, depending on
         the presence or absence of the single (positional-only) event
         argument.
         """
-        if event is None:
-            return await self.receive()
+        if args or kwargs:
+            await self.handler.send(*args, **kwargs)
 
         else:
-            await self.send(event)
-            return
-
+            return await self.handler.receive() 
 
 """
 Application base class.
@@ -188,20 +197,24 @@ class Route(Application):
     Extremely bare bones implementation right now, trying to get a basic
     implementation finished.
     """
-    def __init__(self, endpoint, route):
+    def __init__(self, endpoint, route, methods):
         self.endpoint = endpoint
         self._raw_route = route
+        self.methods = methods
 
-    def _match_captured_values(self, captured):
-        """
-        Match the captured path parameters to.
-        """
-        return dict(zip(filter(None, self.capture_groups), captured))
-
-    async def __call__(self, conn, *captured):
-        mapping = self._match_captured_values(captured)
-        result = await self.endpoint(conn, *mapping)
+    async def __call__(self, conn, **captured):
+        result = await self.endpoint(conn, **captured)
         return result
+
+    async def start(self):
+        """
+        Expand the path and set up capturing groups.
+        """
+        self.route = process_route(self._raw_route)
+        return self.route
+
+    async def close(self):
+        pass
 
 
 class Router(Application):
@@ -222,22 +235,229 @@ class Router(Application):
         """
         url = conn.path
         captured, route = self._table[url]
-        result = await route(conn, *captured)
-        await self.handle_result(conn, result)
-        return
+        result = await route(conn, **captured)
 
-    async def handle_result(self, conn, result):
-        """
-        Converts the result from the endpoint into a message and sends
-        it over the connection.
-        """
-        pass
+        event = {
+            "type": "http.response.body",
+            "body": b"",
+            "more_body": False,
+        }
+
+        # The response should be text (str or bytes) or a dict with a field called
+        # 'body' and additional fields that will be added to the response.
+        if isinstance(result, dict):
+            event["body"] += result["body"]
+            response = { **result, "event": event}
+
+        else:
+            if isinstance(result, str):
+                result = result.encode('utf8')
+                
+            event["body"] += result
+            response = event
+
+        await conn(response)
 
     async def start(self):
         for route in self.routes:
-            self._table[route._raw_route] = route
+            expanded_route = await route.start()
+            for method in route.methods:
+                self._table[(method, expanded_route)] = route
 
-        return
+        return self
 
     async def close(self):
         return
+
+
+"""
+The basic route decorator.
+"""
+
+
+def route(rule: str, methods: list[str]=["GET"]):
+    """
+    Register a decorated function as a route.
+
+    Routes are registered at the module level by adding a 
+    __vial_routes__ variable to the global scope. When
+    the app is being built, this variable is searched for
+    on all of the modules 
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods)
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def get(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["GET"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def get(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["POST"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def put(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["PUT"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def delete(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["DELETE"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def options(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["OPTIONS"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def patch(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["PATCH"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def head(rule: str):
+    """
+    Shorthand for registering an endpoint that responds to get requests.
+    """
+    def wrapper(endpoint):
+        new_route = Route(endpoint, rule, methods=["HEAD"])
+        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
+        routes.append(new_route)
+
+        return endpoint
+
+    return wrapper
+
+
+def _gather_routes():
+    """
+    Search imported modules for registered routes (modules that have a
+    __vial_routes__ attribute).
+
+    Return a Router instance from the collected routes. 
+    """
+    routes = _get_module_scope().get("__vial_routes__", [])
+    
+    for module in sys.modules.values():
+        if "__vial_routes__" in vars(module):
+            routes.extend(vars(module)["__vial_routes__"])
+
+    return routes
+
+def _get_module_scope():
+    """
+    Get the globals for the module where this function is called.
+    """
+    module_scope = inspect.currentframe().f_back.f_globals
+    return {k:v for k,v in module_scope.items() if k != '__builtins__'}
+
+
+"""
+Cli and startup functions.
+"""
+
+
+def parse_cli(so="hvdc:", lo=["help", "verbose", "debug", "confs="]):
+    """
+    Basic CLI parser.
+    """
+    opts, args = getopt.gnu_getopt(sys.argv[1:], so, lo)
+
+    d = dict(opts)
+
+    for k in d:
+        if d[k] == '':
+            d[k] = True
+
+    d["args"] = args
+
+    return d
+
+
+def run(host: str="localhost", port: int=8000, config: Optional[Config] = None, *, routes: list, **more_config):
+    """
+    Parse command line arguments, and start the server.
+    """
+    import uvicorn
+
+    optdict = parse_cli()
+
+    if (a := optdict["args"]): # cli always overrides arguments from the script
+        host = a[0]
+        port = int(a[1])
+
+    if "help" in optdict:
+        print(globals()["__doc__"])
+        return
+
+    # TODO: other cli options
+
+    if config is None:
+        config = Config(optdict["config"], **more_config)
+
+    app = Vial(config, routes)
+
+    uvicorn.run(app, host=host, port=port)

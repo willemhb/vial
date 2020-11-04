@@ -1,0 +1,5 @@
+{
+    "db_type":"sqlite",
+    "ws_enabled":true,
+    "http_enabled":true
+}

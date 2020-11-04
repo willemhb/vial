@@ -2,7 +2,7 @@
 The classes in this module are intended primarily to provide an interface
 to the ASGI standard, or otherwise to assist with implementing the spec.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import starmap
 from typing import Union, Iterable, Optional, TypedDict
 from enum import Enum
@@ -12,10 +12,11 @@ from vial.util import MultiDict
 """
 Typedefs.
 """
+Text = Union[str, bytes]
 Json = Union[Iterable, dict, str, bytes, bool, int, float] # ie, serializable
 ASGIStr = Union[str, bytes]
-RawHeaders = Iterable[Iterable[bytes, bytes]]
-Headers = Union[RawHeaders, MultiDict[ASGIStr, Json]]
+RawHeaders = Iterable[Iterable[bytes]]
+Headers = Union[RawHeaders, MultiDict]
 """
 Exception classes.
 """
@@ -31,71 +32,57 @@ Helper classes.
 
 
 @dataclass
-class ConnectionState:
+class HTTPConnectionState:
     """
     Represents all of the state information associated with
     an HTTP connection.
     """
-    scope: dict
-    # application info
+    # where are we in the request/response cycle?
     started: bool = False
+    resp_started: bool = False
     finished: bool = False
 
-    # these attributes hold request data
-    req_headers: Headers = MultiDict()
+    # These attributes hold information about the request body
+    # (this information is not contained in the scope)
     req_body: bytes = b""
     more_req_body: bool = True
 
     # these attributes hold response data
-    resp_headers: Headers = MultiDict()
-    cookies: SimpleCookie = SimpleCookie()
+    headers: Headers = field(default_factory=MultiDict)
+    cookies: SimpleCookie = field(default_factory=SimpleCookie)
     status: int = 200
-    resp_body: bytes = b""
-    more_resp_body: bool = True
-    received_body_length: int = 0
+    body: bytes = b""
+    more_body: bool = True
 
-    def __post_init__(self):
-        self.read_request_headers()
-
-    def read_request_headers(self):
+    def encode_headers(self):
         """
-        Send the request headers from the scope to self.req_headers.
+        Re-encode the response headers to be sent to the server in a send event.
         """
-        decoded = starmap(lambda a, b: a.decode(), b.decode(), self.scope["headers"])
-        self.req_headers.update(decoded)
+        return [(k.encode('utf8'), v.encode('utf8')) for k, v in self.headers.items()]
 
-    def read_event(self, event):
+
+@dataclass
+class WebSocketConnectionState:
+    """
+    Represents all of the state information associated with
+    a WebSocket connection.
+    """
+    # 
+    accepted: bool = False
+    closed: bool = False
+
+    # These attributes hold information about the request body
+    # (this information is not contained in the scope)
+    subprotocol: Optional[str] = None
+    # these attributes hold response data
+    headers: Headers = MultiDict()
+    code: int = 1000
+
+    def encode_headers(self):
         """
-        Interpret the event and update the connection state.
-
-        Assumes that invalid events have already been taken care
-        of.
+        Re-encode the response headers to be sent to the server in a send event.
         """
-        if event["type"] == "http.request":
-            if not self.started:
-                self.started = True
-
-            self.req_body += event["body"]
-
-            if not event["more_body"]:
-                self.more_req_body = False
-
-        elif event["type"] == "http.response.start":
-            self.status = event["status"]
-            self.headers.update(event["headers"])
-            
-
-        elif event["type"] == "http.response.body":
-            self.resp_body += event["body"]
-            self.received_body_length += len(event["body"])
-
-            if not event["more_body"]:
-                self.more_resp_body = False
-                self.headers["content-length"] = self.received_body_length
-                self.finished = True
-
-        else:
-            return
+        return [(k.encode('utf8'), v.encode('utf8')) for k, v in self.headers.items()]
 
 
 class AsgiTypeKeys(str, Enum):
@@ -103,15 +90,9 @@ class AsgiTypeKeys(str, Enum):
     Subclasses of this Enum associate ASGI events of a particular type with a specific
     Typed dict callable.
     """
-    def __new__(cls, value, evt_dct_cls):
-        """
-        The actual value is the first argument, the .
-        """
-        obj = str.__new__(cls, value)
-        obj._value_ = value
-        obj._evt_cls = evt_dct_cls
-        return obj
-
+    @classmethod
+    def typekeys(cls):
+        return set(s.value for s in cls)
 
 
 class HTTPResponse(BaseException):
@@ -143,97 +124,64 @@ class HTTPError(Exception):
 
 
 """
-Event classes.
+Event & scope classes.
 """
 
 
-class BaseEvent(dict):
+class BaseEvent(TypedDict):
     """
-    Use Types Enum to validate keys to validate keys passed to constructor.
+    Minimal set of keys required in an event.
     """
-    def __new__(cls, **kwargs):
-        """
-        Try to match the supplied event type to one of the patterns in HTTPTypes.
-        """
-
-        if (evt_type := kwargs.get("type", None)) is None:
-            raise TypeError("Missing required key 'type'.")
-
-        try:
-            return getattr(cls, cls.Types(evt_type)._evt_cls)(**kwargs)
-
-        except ValueError as e:
-            raise e
+    type: str
 
 
-class HTTPEvent(BaseEvent):
-    class Types(AsgiTypeKeys):
-        REQUEST = "http.request", "BodyEvent"
-        RESPONSE_START = "http.response.start", "ResponseEvent"
-        RESPONSE_BODY = "http.response.body", "BodyEvent"
-        DISCONNECT = "http.disconnect", "Core"
-
-    class Core(TypedDict):
-        type: str
-
-    class BodyEvent(Core):
-        body: bytes
-        more_body: bool
-
-    class ResponseEvent(Core):
-        status: int
-        headers: Headers
+class HTTPEvent(BaseEvent, total=False):
+    body: bytes
+    more_body: bool
+    status: int
+    headers: RawHeaders
 
 
-class WebSocketEvent(BaseEvent):
-    class Types(AsgiTypeKeys):
-        CONNECT = "websocket.connect", "Core"
-        ACCEPT = "websocket.accept", "Accept"
-        RECEIVE = "websocket.receive", "BodyEvent"
-        SEND = "websocket.send", "BodyEvent"
-        DISCONNECT = "websocket.disconnect", "CodeEvent"
-        CLOSE = "websocket.close", "CodeEvent"
-
-    class Core(TypedDict):
-        type: str
-
-    class Accept(Core):
-        subprotocol: str
-        headers: Headers
-
-    class BodyEvent(Core):
-        bytes: bytes
-        text: str
-
-    class CodeEvent(Core):
-        code: int
+class HTTPEventTypes(AsgiTypeKeys):
+    REQUEST = "http.request"
+    RESPONSE_START = "http.response.start"
+    RESPONSE_BODY = "http.response.body"
+    DISCONNECT = "http.disconnect"
 
 
-class LifespanEvent(BaseEvent):
-    class Types(AsgiTypeKeys):
-        STARTUP = "lifespan.startup", "Core"
-        STARTUP_COMPLETE = "lifespan.startup.complete", "Core"
-        STARTUP_FAILED = "lifespan.startup.failed", "Failure"
-        SHUTDOWN = "lifespan.shutdown", "Core"
-        SHUTDOWN_COMPLETE = "lifespan.shutdown.complete", "Core"
-        SHUTDOWN_FAILED = "lifespan.shutdown.failed", "Failure"
-
-    class Core(TypedDict):
-        type: str
-
-    class Failure(Core):
-        message: str
+class WebSocketEvent(BaseEvent, total=False):
+    subprotocol: str
+    headers: RawHeaders
+    bytes: Optional[bytes]
+    text: Optional[str]
+    code: int
 
 
-"""
-Scopes classes.
-"""
+class WebSocketEventTypes(AsgiTypeKeys):
+    CONNECT = "websocket.connect"
+    ACCEPT = "websocket.accept"
+    RECEIVE = "websocket.receive"
+    SEND = "websocket.send"
+    DISCONNECT = "websocket.disconnect"
+    CLOSE = "websocket.close"
+
+
+class LifespanEvent(BaseEvent, total=False):
+    message: str
+
+
+class LifespanEventTypes(AsgiTypeKeys):
+    STARTUP = "lifespan.startup"
+    STARTUP_COMPLETE = "lifespan.startup.complete"
+    STARTUP_FAILED = "lifespan.startup.failed"
+    SHUTDOWN = "lifespan.shutdown"
+    SHUTDOWN_COMPLETE = "lifespan.shutdown.complete"
+    SHUTDOWN_FAILED = "lifespan.shutdown.failed"
 
 
 class BaseScope(TypedDict):
     type: str
     asgi: dict[str, str]
-    
 
 
 class HTTPScope(BaseScope):
@@ -244,7 +192,7 @@ class HTTPScope(BaseScope):
     raw_path: bytes
     query_string: bytes
     root_path: str
-    headers: Headers
+    headers: RawHeaders
     client: tuple[str, int]
     server: tuple[str, int]
 
@@ -257,7 +205,7 @@ class WebsocketScope(BaseScope):
     raw_path: bytes
     query_string: bytes
     root_path: str
-    headers: Headers
+    headers: RawHeaders
     client: tuple[str, int]
     server: tuple[str, int]
     subprotocols: Iterable[str]
@@ -268,88 +216,190 @@ class LifespanScope(BaseScope):
 
 
 """
-Event Handlers are callables that handle the scope-specific logic of a connection.
-A connection dispatches a handler classed based on the scope type, raising an exception
-if it has no compatible handlers.
+Event handler classes.
 """
 
 
 class BaseEventHandler:
     """
-    Common ancestor of all event handlers.
+    Base class for WS and HTTP event handlers.
+    
+    These classes abstract the handling of protocol messages.
     """
-    def __init__(self, receive, send):
+    def __init_subclass__(cls, *, events, states, **kwargs):
+        """`events` should be subclasses of AsgiTypeKeys."""
+        super().__init_subclass__(**kwargs)
+        cls.events = events.typekeys()
+        cls.states = states
+
+    def __init__(self, scope, receive, send):
+        self.scope = scope
         self._receive = receive
         self._send = send
+        # Create a new instance of the state 
+        self.state = self.states()
+
+    def validate_event_type(self, event):
+        if event["type"] not in self.events:
+            raise ValueError(f"Unknown event type {event['type']} for {self.scope['type']}.")
 
     async def receive(self):
-        raise NotImplementedError("Subclasses most override this method.")
-
-    async def send(self, event):
         raise NotImplementedError("Subclasses must override this method.")
 
+    async def send(self, *args, **kwargs):
+        raise NotImplementedError("Subclasses are required to override this method.")
 
-class HTTPEventHandler(BaseEventHandler):
+
+class HTTPEventHandler(BaseEventHandler, events=HTTPEventTypes, states=HTTPConnectionState):
     """
-    Handles HTTP messages.
-
-    For now, this class simply returns the entire body as a single chunk for
-    both send and receive events.
+    Handle HTTP event messages; manage state and .
     """
-    def __init__(self, receive, send):
-        super().__init__(self, receive, send)
-
-        # Connection specific state
-        self._response_start = None
-        self._response_body = bytearray()
-        self._complete = False
-    
     async def receive(self):
-        """
-        Call self._receive
-        """
-        event = await self._receive()
+        if self.state.finished:
+            raise ValueError("Attempt to call a closed connection.")
 
-        if event["type"] == "http.request":
-            body = bytearray()
+        if not self.state.started:
+            self.state.started = True
 
-            while event["more_body"]:
-                body.extend(event["body"])
+            while self.state.more_req_body:
+                msg = await self._receive()
 
-                event = await self._receive()
-
-            else: # Call at least once
-                body.extend(event["body"])
+                if msg["type"] == "http.request":
+                    self.state.body += msg["body"]
+                    self.state.more_req_body = msg["more_body"]
 
             return {
                 "type": "http.request",
-                "body": bytes(body),
+                "body": self.state.req_body,
                 "more_body": False,
             }
 
-        elif event["type"] == "http.disconnect":
-            return event
+        return msg # Otherwise, the event is an http.disconnect event
 
-        else:
-            raise ASGIError(f"Unknown http event type {event['type']}")
+    async def send(self, response: Union[Text, dict], finished: bool=False):
+        """
+        Response is either a dictionary of HTTP event keys or a text sequence.
+        
+        If a dict, the keys in the dict ar eused to update the connection state.
+        If the dict has no key for 'body', the response is not sent. If it does,
+        the 'http.response.start' message is sent.
 
-    async def send(self, event):
-        if event["type"] == "http.response.start":
-            # Save the response start, but don't send it until the body is received
-            self._response_start = event
+        When finished is True, the connection state is updated to reflect the closing
+        of the connection.
+        """
+        self.state.finished = finished
+        self.state.more_body = finished
 
-        elif event["type"] == "http.response.body":
-            self._response_body.extend(event["body"])
+        if isinstance(response, dict):
+            if "status" in response:
+                self.state.status = response["status"]
 
-            if not event["more_body"]:
-                # send the start and the body
-                await self._send(self._response_start)
+            if "headers" in response:
+                self.state.headers.update(response["headers"])
+
+            if "body" in response:
+                self.state.body += response["body"]
+                self.state.resp_started = True
+
+                event = {
+                    "type": "http.response.start",
+                    "status": self.state.status,
+                    "headers": self.state.encode_headers(),
+                }
+
+                await self._send(event)
+
+            return # wait to send the response start until the full response
+                   # start has been received
+
+        if isinstance(response, str):
+            response = str.encode('utf8')
+
+        self.state.body += response
+
+        if self.state.finished:
+            event = {
+                "type": "http.response.body",
+                "body": self.state.body,
+                "more_body": False,
+            }
+
+
+
+class WebSocketEventHandler(BaseEventHandler, events=WebSocketEventTypes, states=WebSocketConnectionState):
+    """
+    Handle WebSocket event messages.
+    """
+
+    def validate_connection(self):
+        return True
+
+    async def receive(self):
+        if self.state.finished:
+            raise ValueError("Attempt to call a closed connection.")
+
+        if not self.state.started:
+            self.state.started = True
+
+        msg = await self._receive()
+        msgtype = msg["type"]
+
+        if msgtype == "websocket.connect":
+            if self.validate_connection():
                 await self._send({
-                    "type": "http.response.body",
-                    "body": bytes(self._response_body),
-                    "more_body": False,
+                    "type": "websocket.accept",
+                    "subprotocol": self.state.subprotocol,
+                    "headers": self.state.encode_headers(),
                 })
-                self._complete = True
+                
 
             else:
-                raise ASGIError(f"Unknown http event type {event['type']}")
+                self.state.finished = True
+                await self._send({
+                    "type": "websocket.close",
+                    "code": 1006,
+                })
+
+            return
+
+        elif msgtype == "websocket.receive":
+            if msg["bytes"] or msg["text"]:
+                return msg
+
+            else:
+                raise ValueError("No content in message")
+
+        elif msgtype == "websocket.disconnect":
+            # return the disconnect event so the endpoint can do cleanup
+            return msg
+
+    async def send(self, txt: Optional[str]=None, bts: Optional[bytes]=None, *, close: bool=False, code: Optional[int]=None):
+        """
+        When finished is True, the connection state is updated to reflect the closing
+        of the connection.
+        """
+        if self.state.finished and txt is not None or bts is not None:
+            raise ValueError("Cannot send data over a closed connection.")
+
+        if close:
+            event = {
+                "type": "websocket.disconnect",
+                "code": code or self.status.code,
+            }
+
+            await self._send(event)
+
+            self.state.finished = True
+
+        elif txt is None and bts is None:
+            raise ValueError("At least one of text and bytes is required.")
+
+        else:
+            event = {
+                "type": "websocket.send",
+                "text": txt,
+                "bytes": bts,
+            }
+
+            await self._send(event)
+            return

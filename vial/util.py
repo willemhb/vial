@@ -3,7 +3,7 @@ This module provides a set of core datastructures useful for implementing ASGI f
 (similar to Werkzeug). It also provides general helper functions for working with urls, 
 requests, etc.
 """
-import re
+import re, os, sys, json
 from functools import wraps, cached_property
 from itertools import chain, starmap, zip_longest, filterfalse, tee
 from dataclasses import dataclass, is_dataclass
@@ -594,7 +594,7 @@ def process_route(route):
     patterns = []
 
     for name, re_name, re_pat in capture_groups:
-        if re_name == '' and re_pat == '':
+        if not (re_name or re_pat):
             patterns.append(NAMED_CAPTURING_PAT % (name, MATCH_TO_SLASH_PAT))
 
         elif re_pat == '' and re_name:
@@ -606,56 +606,6 @@ def process_route(route):
     new_route = new_route.format(*patterns)
 
     return "^%s$" % new_route
-
-
-def expand_route(route):
-    """
-    Replace capture groups with their corresponding regular expressions,
-    keeping a record of the capture names (these will later be used to match
-    names to arguments when the route function is called).
-    """
-    names = []
-    index = []
-
-    new_route = re.sub(CAPTURE_GROUP_PAT, "{}", route)
-
-    for route_part in route.strip("/").split("/"):
-        if route_part.startswith("<"):
-            names.append(route_part[1:-1])
-            index.append("__matching__")
-
-        else:
-            index.append(route_part)
-            names.append(None)  # Put a dummy into the list of names for all static names
-
-    return names, tuple(index), new_route.format(*[r"[^/]+"] * len(names))
-
-
-def parse_route(route, static_names):
-    """
-    Return an index suitable for use in a SparseArray of routes.
-    """
-    index = []
-    captured = []
-
-    route_parts = route.strip("/").split("/")
-
-    for route_part in route_parts:
-        if route_part not in static_names:
-            index.append("__matching__")
-            captured.append(route_part)
-
-        else:
-            index.append(route_part)
-
-    return captured, tuple(index)
-
-
-class NoMatch(BaseException):
-    """
-    Returned when a RuleTable can't match a supplied key.
-    """
-    pass
 
 
 class RuleTable:
@@ -670,31 +620,186 @@ class RuleTable:
     endpoints    - a sparse array of all of the endpoints mapped by this table.
     """
     def __init__(self):
-        self.static_names = set()
-        self.endpoints = SparseArray()
+        # endpoints are organized by method to narrow down the search
+        self.routes = {
+            "GET": {},
+            "HEAD": {},
+            "POST": {},
+            "PUT": {},
+            "DELETE": {},
+            "CONNECT": {},
+            "OPTIONS": {},
+            "TRACE": {},
+            "PATCH": {},
+        }
 
-    def __setitem__(self, path, endpoint):
-        names, index, expanded_path = expand_route(path)
-        for element in index:
-            if element != "__matching__":
-                self.static_names.add(element)
+    def __getitem__(self, meth_path):
+        # routes 
+        method, path = meth_path
 
-        endpoint.capture_groups = names
-        endpoint.expanded_path = expanded_path
+        for route in self.routes[method]:
+            if (match := re.match(route, path)):
+                captured = match.groupdict()
+                return captured, self.endpoints[method][route]
 
-        if index in self.endpoints:
-            raise TypeError(f"Ambiguous route patterns: {expanded_path} matched twice.")
+        return NoMatch
 
-        self.endpoints[index] = endpoint
+    def __setitem__(self, meth_path, endpoint):
+        method, path = meth_path
 
-    def __getitem__(self, path):
-        captured_items, index = parse_route(path, self.static_names)
+        if self.routes[method].get(path):
+            raise ValueError(f"Ambiguous route: {path} assigned to two routes.")
 
-        try:
-            return captured_items, self.endpoints[index]
-
-        except KeyError:
-            raise NoMatch("Couldn't match supplied url to an existing endpoint.")
+        self.routes[method][path] = endpoint
 
     def __repr__(self):
-        return f"RuleTable({', '.join(starmap('{}: {}'.format, self.endpoints.items()))})"
+        outstring = "RuleTable({})"
+        methods = []
+
+        for method in self.routes:
+            method_strings = ", ".join(starmap("({}, {})".format, self.routes[method].items()))
+            methods.append(f"{method}: [{method_strings}]")
+
+        return outstring.format(", ".join(methods))
+
+    __str__ = __repr__
+
+
+class NoMatch(BaseException):
+    """
+    Returned when a RuleTable can't match a supplied key.
+    """
+    pass
+
+
+"""
+File handling utilities (for config parsing).
+"""
+CONFIG_HEADING_PAT = re.compile(r"^[\[](.+)[\]]$")
+CONFIG_SETTING_PAT = re.compile(r"^(\w+)\s*=\s*(\w+)$")
+SIMPLE_LITERAL_PAT = re.compile(r"""(?P<int>-?\d+)|(?P<bool>(?:True)|(?:False))|((?P<float>-?[\d\.]+))""")
+
+
+def load_dotenv(fname: str):
+    """
+    Add settings from a .env file to the system environment variables.
+    """
+    with open(fname, "rt") as dotenv:
+        for line in dotenv:
+            if (l := line.strip()):
+                k, v = CONFIG_SETTING_PAT.match(l).groups()
+                os.environ[k] = v
+
+    return
+
+
+class Config(dict):
+    """
+    A simple class for loading configurations from 
+
+    
+    """
+    def __init__(self, conf_files=[], *args, **kwargs):
+        super().__init__(self, *args, **kwargs)
+
+        for conf_file in conf_files:
+            if conf_file.endswith(".env"):
+                load_dotenv(conf_file)
+
+            elif conf_file.endswith(".json"):
+                self.load_js(conf_file)
+                
+            else:
+                self.load(conf_file)
+
+    def load(self, conf_file: str):
+        """
+        Load configurations from the supplied configuration file, declining
+        to override keys that already exist.
+        """
+        with open(conf_file) as config:
+            for line in config:
+                if (l := line.strip()):  # skip blank lines
+                    if (m := CONFIG_HEADING_PAT.match(l)):
+                        heading_name = m[1]
+                        self[heading_name] = {}
+
+                    elif (s := CONFIG_SETTING_PAT.match(l)):
+                        k, v = s[1], s[2]
+
+                        if (pt := SIMPLE_LITERAL_PAT.fullmatch(v)):
+                            for n, p in pt.groupdict():
+                                if p:
+                                    if n == "int":
+                                        v = int(v)
+
+                                    elif n == "float":
+                                        v = float(v)
+
+                                    else:
+                                        v = bool(v)
+
+                        self[heading_name][k] = v
+
+                    else:
+                        raise ValueError("Failed to parse line {l} in {conf_file}")
+
+        return
+
+    def load_js(self, conf_file: str):
+        """
+        Load configurations from a json file (different parsing strategy).
+        """
+        with open(conf_file) as js:
+            from_disk = json.load(js)
+
+        for k in from_disk:
+            if k not in self:
+                self[k] = from_disk
+
+    def __getitem__(self, key):
+        """
+        Fall back to checking for key in the OS environment.
+        """
+        try:
+            return super().__getitem__(self, key)
+
+        except KeyError as e:
+            try:
+                return os.environ[key]
+
+            except Exception:
+                raise e
+
+
+"""
+Template parser.
+
+This implements the same (more or less) Simple Template language introduced in Bottle.
+"""
+
+def parse_template(tpl: str):
+    """
+    Parse a template into its .
+    """
+    scanner = re.Scanner([
+        (r"{{\s*.+\s*}}", lambda sc, tk: ("expression", tk)),
+        (r"{%\s*.+\s*%}", lambda sc, tk: ("statement", tk)),
+        (r"(?s:%.+%end)+", lambda sc, tk: ("block", tk)),
+        ("[^{%]+", lambda sc, tk: ("html", tk)),
+    ])
+
+    return scanner.scan(tpl)
+
+
+def eval_template_expression(expr: str, context: dict) -> tuple[str, dict]:
+    """
+    Evaluate a template expression with context as the local environment.
+    
+    Return the result of the evaluation and the (possibly updated) context.
+    """
+    expression = re.match(r"{{(.+)}}", expr)[1]
+
+    result = eval(expression, globals(), context)
+
+    return str(result, context)
