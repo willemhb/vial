@@ -179,7 +179,7 @@ class Connection:
             await self.handler.send(*args, **kwargs)
 
         else:
-            return await self.handler.receive() 
+            return await self.handler.receive()
 
 """
 Application base class.
@@ -236,26 +236,6 @@ class Router(Application):
         url = conn.path
         captured, route = self._table[url]
         result = await route(conn, **captured)
-
-        event = {
-            "type": "http.response.body",
-            "body": b"",
-            "more_body": False,
-        }
-
-        # The response should be text (str or bytes) or a dict with a field called
-        # 'body' and additional fields that will be added to the response.
-        if isinstance(result, dict):
-            event["body"] += result["body"]
-            response = { **result, "event": event}
-
-        else:
-            if isinstance(result, str):
-                result = result.encode('utf8')
-                
-            event["body"] += result
-            response = event
-
         await conn(response)
 
     async def start(self):

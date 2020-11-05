@@ -777,29 +777,119 @@ Template parser.
 
 This implements the same (more or less) Simple Template language introduced in Bottle.
 """
+PYINDENT = 4  # the number of spaces to use for each indent level
+blockkw = r"([^:]+:)"
+
+
+def getindent(indent: int) -> str:
+    return PYINDENT * indent * " "
+
+
+def normalize_tabs(string: str) -> str:
+    return string.replace("\t", getindent(1))
+
+
+def count_whitespace_prefix(line: str) -> int:
+    """
+    Return the number of whitespace characters in the prefix of line.
+    """
+    return re.match(r"\s*", line).end()
+
+
+def parse_statements(block: str) -> list[str]:
+    lines = block.split("\n")
+    cleaned = []
+
+    for i, l  in enumerate(lines):
+        if i == 1:
+            prefix = count_whitespace_prefix(l)
+
+        cleaned.append(l[prefix:])
+
+    return cleaned
+
+
+def parse_block(block: str, indent: int=0) -> list:
+    """
+    Parse a block statement into a sequence of blocks; keep track of the indentation level.
+    """
+    match_pat = r"(?s:([^:]+:)(.+))%end$"
+    search_pat = r"(?s:%.+%end)+"
+
+    match = re.match(match_pat, block)
+
+    if match is not None:
+        start, rest = match.groups()
+
+        search = re.partition(search_pat, rest)
+
+        return [start, indent, parse_block(rest, indent + 1)]
+
+    else:
+        pass
 
 def parse_template(tpl: str):
     """
-    Parse a template into its .
+    Parse a template into its component tokens.
     """
+
     scanner = re.Scanner([
-        (r"{{\s*.+\s*}}", lambda sc, tk: ("expression", tk)),
-        (r"{%\s*.+\s*%}", lambda sc, tk: ("statement", tk)),
-        (r"(?s:%.+%end)+", lambda sc, tk: ("block", tk)),
+        (r"{{\s*.+\s*}}", lambda sc, tk: ("expression", tk[2:-2].strip())),
+        (r"(?s:%{3}.+%{3})", lambda sc, tk: ("statements", parse_statements(tk[3:-3]))),
+        (r"%{2}[^\n]+", lambda sc, tk: ("statement", tk[2:].strip())),
+        (r"(?s:%.+%end)+", lambda sc, tk: ("block", parse_block(tk))),
         ("[^{%]+", lambda sc, tk: ("html", tk)),
     ])
 
     return scanner.scan(tpl)
 
 
-def eval_template_expression(expr: str, context: dict) -> tuple[str, dict]:
+def add_to_buffer(buff: list, code: str, indent: int) -> list:
     """
-    Evaluate a template expression with context as the local environment.
+    Add the line of code to the buffer with the correct indentation prefix.
+    """
+    buff.append(indent * PYINDENT * " " + code)
+
+    return buff
+
+
+def compile_template(fname: str):
+    """
+    Read the file named `fname` and compile it into a callable that produces 
+    the rendered result.
+    """
+    with open(fname, "rt") as source:
+        source_text = normalize_tabs(source.read())
+
+    tokens = parse_template(source_text)
+    _lines = ["def _execute_template(**kwargs):", "    _buffer = []", "    while True:"]
+    _indent = 2
+
+    for toktype, token in tokens:
+        if toktype == "html":
+            _line1 = "_buffer.append(" + token + ")"
+            add_to_buffer(_lines, _line1, _indent)
+
+        elif toktype == "expression":
+            _line1 = "_tmp = " + token
+            _line2 = "_buffer.append(str(_tmp))"
+            add_to_buffer(_lines, _line1, _indent)
+            add_to_buffer(_lines, _line2, _indent)
+
+        elif toktype == "statement":
+            add_to_buffer(_lines, token, _indent)
+
+        elif toktype == "statements":
+            for _tok in tokens:
+                add_to_buffer(_lines, token, _indent)
+
+        elif toktype == "block":
+            for _tok in tokens:
+                pass
+
+        else:
+            pass
+
+    return tokens
+
     
-    Return the result of the evaluation and the (possibly updated) context.
-    """
-    expression = re.match(r"{{(.+)}}", expr)[1]
-
-    result = eval(expression, globals(), context)
-
-    return str(result, context)
