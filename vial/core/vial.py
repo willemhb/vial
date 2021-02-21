@@ -24,6 +24,7 @@ It provides:
 
     - An interface to Jinja2 templates.
 """
+
 import sys, os, getopt, inspect
 from functools import cached_property
 from vial.asgi import (HTTPConnectionState, WebSocketConnectionState,
@@ -255,79 +256,6 @@ The basic route decorator.
 """
 
 
-def route(rule: str, methods: list[str]=["GET"]):
-    """
-    Register a decorated function as a route.
-
-    Routes are registered at the module level by adding a 
-    __vial_routes__ variable to the global scope. When
-    the app is being built, this variable is searched for
-    on all of the modules 
-    """
-    def wrapper(endpoint):
-        new_route = Route(endpoint, rule, methods)
-        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
-        routes.append(new_route)
-
-        return endpoint
-
-    return wrapper
-
-
-def get(rule: str):
-    """
-    Shorthand for registering an endpoint that responds to get requests.
-    """
-    def wrapper(endpoint):
-        new_route = Route(endpoint, rule, methods=["GET"])
-        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
-        routes.append(new_route)
-
-        return endpoint
-
-    return wrapper
-
-
-def get(rule: str):
-    """
-    Shorthand for registering an endpoint that responds to get requests.
-    """
-    def wrapper(endpoint):
-        new_route = Route(endpoint, rule, methods=["POST"])
-        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
-        routes.append(new_route)
-
-        return endpoint
-
-    return wrapper
-
-
-def put(rule: str):
-    """
-    Shorthand for registering an endpoint that responds to get requests.
-    """
-    def wrapper(endpoint):
-        new_route = Route(endpoint, rule, methods=["PUT"])
-        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
-        routes.append(new_route)
-
-        return endpoint
-
-    return wrapper
-
-
-def delete(rule: str):
-    """
-    Shorthand for registering an endpoint that responds to get requests.
-    """
-    def wrapper(endpoint):
-        new_route = Route(endpoint, rule, methods=["DELETE"])
-        routes = endpoint.__globals__.setdefault("__vial_routes__", [])
-        routes.append(new_route)
-
-        return endpoint
-
-    return wrapper
 
 
 def options(rule: str):

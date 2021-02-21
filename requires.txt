@@ -1,0 +1,8 @@
+jinja2
+immutables
+uvicorn
+pydantic
+python-dotenv
+aiosqlite
+aiomysql
+aiostaticfiles
